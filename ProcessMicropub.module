@@ -1,0 +1,227 @@
+<?php
+/**
+ * This module adds Micropub support to ProcessWire.
+ * @see https://micropub.spec.indieweb.org/
+ *
+ * @author gRegor Morrill, https://gregorlove.com
+ * @copyright 2021 gRegor Morrill
+ * @license https://opensource.org/licenses/MIT MIT
+ */
+
+declare(strict_types=1);
+
+namespace ProcessWire;
+
+class ProcessMicropub extends Process
+{
+    /**
+     * Return information about this module
+     */
+    public static function getModuleInfo(): array
+    {
+        return [
+            'title' => 'Micropub',
+            'version' => '001',
+            'author' => 'gRegor Morrill, https://gregorlove.com/',
+            'summary' => 'The Micropub standard lets you publish to your site using third-party clients',
+            'href' => 'https://micropub.net/',
+            'requires' => [
+                'PHP>=7.0',
+                'ProcessWire>=3.0',
+            ],
+            'autoload' => true,
+            'singular' => true,
+            'permission' => 'page-view',
+        ];
+    }
+
+    public function ___install(): void
+    {
+        $templates = file_get_contents(__DIR__ . '/data/templates.json');
+        $this->importTemplates($templates);
+
+        # attempt to set up the micropub-endpoint page
+        $endpoint = $this->pages->get('template=micropub-endpoint');
+        if ($endpoint instanceof NullPage) {
+            $endpoint = new Page();
+            $endpoint->template = 'micropub-endpoint';
+            $endpoint->parent = 1;
+            $endpoint->title = 'Micropub Endpoint';
+            if ($endpoint->save()) {
+                $this->message(sprintf('Added page: %s', $endpoint->url));
+            }
+        }
+
+        $this->message('To complete installation, ensure the template file micropub-endpoint.php is put in the /site/templates/ directory.');
+    }
+
+    /**
+     * Get the HTML <link> elements for endpoint
+     */
+    public function getLinkElements(): string
+    {
+        $output = '';
+        $endpoint = $this->pages->get('template=micropub-endpoint');
+        if (!($endpoint instanceof NullPage) && $endpoint->viewable()) {
+            $output .= sprintf('<link rel="micropub" href="%s">', $endpoint->url);
+        } else {
+            $output .= '<!-- IndieAuth: no public page found with template=micropub-endpoint -->';
+        }
+
+        return $output;
+    }
+
+    /**
+     * Handle GET and POST requests to the micropub endpoint
+     */
+    public function endpoint(): void
+    {
+        $input = $this->wire('input');
+        $modules = $this->wire('modules');
+
+        if ($input->requestMethod() === 'GET') {
+            $this->debug('TODO: handle GET');
+        } elseif ($input->requestMethod() === 'POST') {
+            $bearer_token = $this->getBearerToken();
+            if (!$bearer_token) {
+                $this->httpResponse([
+                    'error' => 'unauthorized',
+                    'error_description' => 'No access token provided in request',
+                ], 401);
+            }
+
+            $token = null;
+
+            if ($this->token_endpoint) {
+                $this->debug('TODO handle external token endpoint');
+            } elseif ($modules->isInstalled('ProcessIndieAuth')) {
+                $token = $modules->get('ProcessIndieAuth')->verifyToken($bearer_token);
+            }
+
+            if (!$token) {
+                $this->httpResponse([
+                    'error' => 'forbidden',
+                    'error_description' => 'Invalid access token',
+                ], 403);
+            }
+
+            $scopes = [];
+            if (array_key_exists('scope', $token)) {
+                $scopes = array_filter(
+                    array_map(
+                        'trim',
+                        explode(' ', $token['scope'])
+                    )
+                );
+            }
+
+            if (!$scopes || !in_array('create', $scopes)) {
+                $this->httpResponse([
+                    'error' => 'insufficient_scope',
+                    'error_description' => 'Access token does not have necessary scope(s)',
+                    'scope' => 'create',
+                ], 403);
+            }
+
+            $this->debug('Debugging: Micropub request received');
+        }
+    }
+
+    /**
+     * Get the Bearer token from request headers
+     */
+    private function getBearerToken(): ?string
+    {
+        $headers = \getallheaders();
+
+        if (array_key_exists('Authorization', $headers) && preg_match('/^Bearer (.+)/', $headers['Authorization'], $matches)) {
+            return $matches[1];
+        }
+
+        return null;
+    }
+
+    private function httpResponse($response, int $http_status = 400): void
+    {
+        http_response_code($http_status);
+
+        /*if ($http_status === 401) {
+            header(sprintf('WWW-Authenticate: Bearer realm="%s"', $this->urls->httpRoot));
+        }*/
+
+        if (is_array($response)) {
+            echo json_encode($response);
+        } else {
+            echo $response;
+        }
+
+        exit;
+    }
+
+    /**
+     * Import templates from JSON or array
+     * @param string|array $json
+     * @return bool
+     * @see https://processwire.com/talk/topic/9007-utility-to-help-generate-module-install-function/?do=findComment&comment=86995
+     */
+    private function importTemplates($json): void
+    {
+        $data = is_array($json) ? $json : wireDecodeJSON($json);
+
+        foreach ($data as $name => $template_data) {
+            # ensure no template ID to avoid conflicts
+            unset($template_data['id']);
+
+            $template = $this->templates->get($name);
+
+            # template doesn't exist already; create it
+            if (!$template) {
+                $template = new Template();
+                $template->name = $name;
+
+                # import the data for the template
+                $template->setImportData($template_data);
+
+                $fieldgroup = $template->fieldgroup;
+                $fieldgroup->save();
+                $fieldgroup->saveContext();
+                $template->save();
+
+                # no fieldgroup set for template
+                if (!$template->fieldgroup_id) {
+                    $template->setFieldgroup($fieldgroup);
+                    $template->save();
+                }
+
+                $this->message(sprintf('Added template: %s', $name));
+            } else {
+                $this->message(sprintf('Skipped existing template: %s', $name));
+            }
+        }
+    }
+
+    private function debug($var, bool $as_html = false): void
+    {
+        if ($as_html) {
+            echo '<pre>';
+        } else {
+            header('Content-Type: text/plain; charset=utf8');
+        }
+
+        if (is_array($var) || is_object($var)) {
+            print_r($var);
+        } else {
+            echo $var;
+        }
+
+        echo "\n\nvar dump:\n";
+        var_dump($var);
+
+        if ($as_html) {
+            echo '</pre>';
+        }
+
+        exit;
+    }
+}
+
