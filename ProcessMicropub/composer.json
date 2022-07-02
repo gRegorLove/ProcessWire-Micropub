@@ -1,0 +1,9 @@
+{
+    "require": {
+        "barnabywalters/mf-cleaner": "^0.1.4",
+        "p3k/micropub": "dev-master"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9"
+    }
+}

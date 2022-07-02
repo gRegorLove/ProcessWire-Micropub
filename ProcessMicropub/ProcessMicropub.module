@@ -4,7 +4,7 @@
  * @see https://micropub.spec.indieweb.org/
  *
  * @author gRegor Morrill, https://gregorlove.com
- * @copyright 2021 gRegor Morrill
+ * @copyright 2021-2022 gRegor Morrill
  * @license https://opensource.org/licenses/MIT MIT
  */
 
@@ -12,8 +12,30 @@ declare(strict_types=1);
 
 namespace ProcessWire;
 
+use JsonException;
+use Barnabywalters\Mf2 as Mf2Helper;
+use p3k\Micropub;
+
 class ProcessMicropub extends Process
 {
+    # post-type constants
+    const TYPE_UNKNOWN = 0;
+    const TYPE_NOTE = 1;
+    const TYPE_ARTICLE = 2;
+    const TYPE_REPLY = 3;
+    const TYPE_LIKE = 4;
+    const TYPE_RSVP = 5;
+    const TYPE_BOOKMARK = 6;
+    const TYPE_REPOST = 7;
+    const TYPE_PHOTO = 8;
+    const TYPE_VIDEO = 9;
+
+    private int $type = 0;
+
+    private $request;
+
+    private $microformats;
+
     /**
      * Return information about this module
      */
@@ -52,7 +74,34 @@ class ProcessMicropub extends Process
             }
         }
 
+        # attempt to set up the micropub-posts page
+        $endpoint = $this->pages->get('template=micropub-posts');
+        if ($endpoint instanceof NullPage) {
+            $endpoint = new Page();
+            $endpoint->template = 'micropub-posts';
+            $endpoint->parent = 1;
+            $endpoint->title = 'Micropub Posts';
+            if ($endpoint->save()) {
+                $this->message(sprintf('Added page: %s', $endpoint->url));
+            }
+        }
+
         $this->message('To complete installation, ensure the template file micropub-endpoint.php is put in the /site/templates/ directory.');
+    }
+
+    public function init(): void
+    {
+        require_once 'vendor/autoload.php';
+    }
+
+    public function setRequest($request): void
+    {
+        $this->request = $request;
+    }
+
+    public function setMicroformats(array $microformats): void
+    {
+        $this->microformats = $microformats;
     }
 
     /**
@@ -65,7 +114,7 @@ class ProcessMicropub extends Process
         if (!($endpoint instanceof NullPage) && $endpoint->viewable()) {
             $output .= sprintf('<link rel="micropub" href="%s">', $endpoint->url);
         } else {
-            $output .= '<!-- IndieAuth: no public page found with template=micropub-endpoint -->';
+            $output .= '<!-- Micropub: no public page found with template=micropub-endpoint -->';
         }
 
         return $output;
@@ -80,7 +129,12 @@ class ProcessMicropub extends Process
         $modules = $this->wire('modules');
 
         if ($input->requestMethod() === 'GET') {
-            $this->debug('TODO: handle GET');
+            $response = sprintf('<p> %s %s <a href="https://micropub.net/">Micropub</a> %s <a href="https://indieweb.org/">IndieWeb</a>. </p>',
+                $message = $this->_('This is a Micropub endpoint.'),
+                $message = $this->_('Learn more about'),
+                $message = $this->_('and the'),
+            );
+            $this->httpResponse($response, 405, ['Allow' => 'POST']);
         } elseif ($input->requestMethod() === 'POST') {
             $bearer_token = $this->getBearerToken();
             if (!$bearer_token) {
@@ -123,8 +177,401 @@ class ProcessMicropub extends Process
                 ], 403);
             }
 
-            $this->debug('Debugging: Micropub request received');
+            $this->parseRequest();
+
+            $page = $this->createPage();
+
+            if (!$page->save()) {
+                $this->httpResponse([
+                    'error' => 'internal_error',
+                    'error_description' => 'Error creating the post',
+                ], 500);
+            }
+
+            if ($this->verbose_logging) {
+                $this->log->save('micropub', 'Final page URL: ' . $page->httpUrl);
+            }
+
+            $this->httpResponse('', 202, ['Location' => $page->httpUrl]);
         }
+    }
+
+    public function ___createPage()
+    {
+        $page = $this->getPage();
+        $page->parent = $this->getPostParent();
+
+        $slug = $this->request->commands['mp-slug'] ?? null;
+        if ($slug) {
+            $page->name = (is_array($slug))
+                ? reset($slug)
+                : $slug;
+        }
+
+        $page = $this->createBasePost($page);
+
+        if ($this->hasProperty('content')) {
+            $this->createContent($page);
+        }
+
+        if ($this->verbose_logging) {
+            $this->log->save('micropub', 'Page template: ' . $page->template);
+        }
+
+        if ($property = $this->getPropertyArray('category')) {
+            $this->createCategories($page, $property);
+        }
+
+        if ($this->wrap_microformat_element) {
+            $this->wrapMicroformatElement($page);
+        }
+
+        if ($this->verbose_logging) {
+            $this->log->save('micropub', 'Final HTML: ' . $page->body);
+        }
+
+        if (!$this->publish_posts) {
+            $page->addStatus(Page::statusUnpublished);
+        }
+
+        return $page;
+    }
+
+    /**
+     * Based on request properties, create the base post
+     *
+     * The order of processing by properties is important here
+     * @see https://indieweb.org/post-type-discovery#Algorithm
+     */
+    public function ___createBasePost(Page $page): Page
+    {
+        if ($this->hasProperty('rsvp')) {
+            $this->type = self::TYPE_RSVP;
+            return $this->createRsvp($page);
+        }
+
+        if ($this->isPropertyValidUrl('in-reply-to')) {
+            $this->type = self::TYPE_REPLY;
+            return $this->createReply($page);
+        }
+
+        if ($this->isPropertyValidUrl('repost-of')) {
+            $this->type = self::TYPE_REPOST;
+            return $this->createRepost($page);
+        }
+
+        if ($this->isPropertyValidUrl('like-of')) {
+            $this->type = self::TYPE_LIKE;
+            return $this->createLike($page);
+        }
+
+        if ($this->isPropertyValidUrl('video')) {
+            $this->type = self::TYPE_VIDEO;
+            return $this->createVideo($page);
+        }
+
+        if ($this->isPropertyValidUrl('photo')) {
+            $this->type = self::TYPE_PHOTO;
+            return $this->createPhoto($page);
+        }
+
+        if ($this->isPropertyValidUrl('bookmark-of')) {
+            $this->type = self::TYPE_BOOKMARK;
+            return $this->createBookmark($page);
+        }
+
+        # default to note if none of the above
+        if ($this->type == self::TYPE_UNKNOWN) {
+            $this->type = self::TYPE_NOTE;
+            $page->template = $this->getPageTemplate('note_template');
+
+            if ($title = $this->createTitle()) {
+                $page->template = $this->getPageTemplate('article_template');
+                $page->title = $title;
+            }
+        }
+
+        return $page;
+    }
+
+    /**
+     * Create an RSVP post
+     * @see https://indieweb.org/rsvp
+     */
+    public function ___createRsvp(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('rsvp_template');
+
+        $content = sprintf('RSVP <span class="p-rsvp">%s</span>',
+            $this->getProperty('rsvp')
+        );
+
+        if ($temp = $this->getProperty('in-reply-to')) {
+            $content .= sprintf(' to <a href="%s" class="u-in-reply-to">%1$s</a>',
+                $temp
+            );
+        }
+
+        $page->body = $this->wrapElement($content, '<p>', '</p>');
+
+        return $page;
+    }
+
+    /**
+     * Create a reply post
+     * @see https://indieweb.org/reply
+     */
+    public function ___createReply(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('reply_template');
+
+        $page->body = sprintf('<p> In reply to: <a href="%s" class="u-in-reply-to">%1$s</a> </p>',
+            $this->getProperty('in-reply-to')
+        );
+
+        return $page;
+    }
+
+    /**
+     * Create a repost post
+     * @see https://indieweb.org/repost
+     */
+    public function ___createRepost(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('repost_template');
+
+        $page->body = sprintf('<p> Reposted: <a href="%s" class="u-repost-of">%1$s</a> </p>',
+            $this->getProperty('repost-of')
+        );
+
+        return $page;
+    }
+
+    /**
+     * Create a like post
+     * @see https://indieweb.org/like
+     */
+    public function ___createLike(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('like_template');
+
+        $page->body = sprintf('<p> Liked: <a href="%s" class="u-like-of">%1$s</a> </p>',
+            $this->getProperty('like-of')
+        );
+
+        return $page;
+    }
+
+    /**
+     * Create a video post
+     * @see https://indieweb.org/video
+     */
+    public function ___createVideo(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('video_template');
+
+        $page->body = sprintf('<video src="%s">Video: <a href="%1$s">%1$s</a> </video>',
+            $this->getProperty('video')
+        );
+
+        return $page;
+    }
+
+    /**
+     * Create a photo post
+     * @see https://indieweb.org/photo
+     */
+    public function ___createPhoto(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('photo_template');
+
+        $page->body = sprintf('<img src="%s" class="u-photo" alt="" />',
+            $this->getProperty('photo')
+        );
+
+        return $page;
+    }
+
+    /**
+     * Create a bookmark post
+     * @see https://indieweb.org/bookmark
+     */
+    public function ___createBookmark(Page $page): Page
+    {
+        $page->template = $this->getPageTemplate('bookmark_template');
+
+        $bookmark_of = $bookmark_title = $this->getProperty('bookmark-of');
+        $classes = ['u-bookmark-of'];
+
+        if ($this->hasProperty('name')) {
+            $bookmark_title = $this->getProperty('name');
+            $classes[] = 'h-cite';
+        }
+
+        $page->body = sprintf('<p> Bookmarked: <a href="%s" class="%s">%s</a> </p>',
+            $bookmark_of,
+            implode(' ', $classes),
+            $bookmark_title
+        );
+
+        return $page;
+    }
+
+    /**
+     * Return the ProcessWire page for the new post
+     */
+    public function ___getPage(): Page
+    {
+        return new Page();
+    }
+
+    public function getPostType(): int
+    {
+        return $this->type;
+    }
+
+    /**
+     * Return the requested template name, if configured.
+     * Otherwise get the default template.
+     * Set template options on the module's config page in ProcessWire admin.
+     */
+    public function ___getPageTemplate(string $template_name): string
+    {
+        if ($this->{$template_name}) {
+            return $this->{$template_name};
+        }
+
+        return $this->default_template;
+    }
+
+    public function ___getPostParent(): int
+    {
+        if ($page = $this->pages->get('template=micropub-posts, include=all')) {
+            return $page->id;
+        }
+
+        return 1;
+    }
+
+    /**
+     * If property exists, return the value and content-type.
+     *
+     * Return an array of the value and content-type, or null if
+     * the property does not exist.
+     */
+    public function getContentAndType(string $name): ?array
+    {
+        $property = $this->getPropertyRaw($name);
+        if (!$property) {
+            return null;
+        }
+
+        $value = '';
+        $type = 'plaintext';
+
+        if (is_array($property)) {
+            /**
+             * $property is an array. Use the first item in the array, then
+             * parse for `html` or fallback to plaintext.
+             */
+            $content = reset($property);
+
+            if (is_string($content)) {
+                $value = $this->sanitizer->textarea($content);
+            } elseif (is_array($content) && array_key_exists('html', $content)) {
+                $type = 'html';
+                $value = $content['html'];
+                # TODO: sanitize HTML
+            }
+
+        } else {
+            # property is a string
+            $value = $this->sanitizer->textarea($property);
+        }
+
+        return compact('value', 'type');
+    }
+
+    /**
+     * Return the string for a post title (name), if any
+     *
+     * If the name property is not a prefix of the content/summary,
+     * then the post type is: article
+     */
+    public function ___createTitle(): ?string
+    {
+        $content = null;
+        if ($this->hasProperty('content')) {
+            $content = $this->getContentAndType('content');
+        } elseif ($this->hasProperty('summary')) {
+            $content = $this->getContentAndType('summary');
+        }
+
+        if (!$content) {
+            return null;
+        }
+
+        if ($name = $this->getProperty('name')) {
+            $normalized_name = $this->normalizeWhitespace($name);
+            $normalized_content = $this->normalizeWhitespace($content['value']);
+
+            if (!$this->isPrefixOf($normalized_name, $normalized_content)) {
+                $this->type = self::TYPE_ARTICLE;
+                return $name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Create content as either HTML or plaintext based on the request
+     */
+    public function ___createContent(Page $page)
+    {
+        $content = $this->getContentAndType('content');
+        if (!$content) {
+            return $page;
+        }
+
+        if ($content['type'] == 'plaintext') {
+            $page->body .= PHP_EOL . $this->wrapElement($content['value'], '<p class="p-content">', '</p>');
+        } else {
+            $page->body .= PHP_EOL . $this->wrapElement($content['value'], '<div class="e-content">');
+        }
+    }
+
+    public function ___createCategories(Page $page, $categories)
+    {
+        if (is_string($categories)) {
+            $categories = [$categories];
+        }
+
+        $output = '';
+        foreach ($categories as $category) {
+            $output .= $this->wrapElement($category, '<span class="p-category">', '</span> ');
+        }
+
+        $page->body .= PHP_EOL . $output;
+    }
+
+    public function hasProperty(string $name): bool
+    {
+        return Mf2Helper\hasProp($this->microformats, $name);
+    }
+
+    public function isPropertyValidUrl(string $name): bool
+    {
+        $property = $this->getProperty($name);
+        if (!$property) {
+            return false;
+        }
+
+        if (!$this->sanitizer->httpUrl($property, ['allowRelative' => false])) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -134,22 +581,129 @@ class ProcessMicropub extends Process
     {
         $headers = \getallheaders();
 
+        # check for token in authorization header
         if (array_key_exists('Authorization', $headers) && preg_match('/^Bearer (.+)/', $headers['Authorization'], $matches)) {
             return $matches[1];
+        }
+
+        # check for form-posted access_token
+        if ($access_token = $this->input->post('access_token')) {
+            return $access_token;
         }
 
         return null;
     }
 
-    private function httpResponse($response, int $http_status = 400): void
+    /**
+     * Parse Micropub JSON or form-encoded request into standard format
+     */
+    private function parseRequest()
     {
+        $input = file_get_contents('php://input');
+        $request = Micropub\Request::create($input);
+
+        if ($request->error) {
+            $this->httpResponse([
+                'error' => $request->error_property,
+                'error_description' => $request->error_description,
+            ]);
+        }
+
+        if ($request->action != 'create') {
+            $this->httpResponse([
+                'error' => 'invalid_request',
+                'error_description' => sprintf('This Micropub endpoint does not currently support action=%s',
+                    $request->action
+                ),
+            ]);
+        }
+
+        $this->setRequest($request);
+        $this->setMicroformats($request->toMf2());
+
+        if ($this->verbose_logging) {
+            $this->log->save('micropub', 'Request type: ' . $request->type);
+            $this->log->save('micropub', 'Request properties: ' . json_encode($request->properties));
+            $this->log->save('micropub', 'Request microformats: ' . json_encode($this->microformats));
+            if ($request->commands) {
+                $this->log->save('micropub', 'Request commands: ' . json_encode($request->commands));
+            }
+        }
+    }
+
+    /**
+     * Get the first value of a property as plaintext
+     *
+     * Note if the property is an array of values, the other
+     * values will be ignored.
+     */
+    private function getProperty(string $name, ?string $default = null): ?string
+    {
+        return Mf2Helper\getPlaintext($this->microformats, $name, $default);
+    }
+
+    /**
+     * Get the plaintext values of a property
+     */
+    private function getPropertyArray(string $name, ?string $default = null): ?array
+    {
+        return Mf2Helper\getPlaintextArray($this->microformats, $name, $default);
+    }
+
+    /**
+     * Get the raw value for a property
+     *
+     * Unlike getProperty and getPropertyArray, this method
+     * will not convert to plaintext. Useful when needing to check
+     * properties that may be objects, like `content.html`
+     */
+    private function getPropertyRaw(string $name, ?string $default = null)
+    {
+        if (array_key_exists($name, $this->microformats['properties'])) {
+            return $this->microformats['properties'][$name];
+        }
+
+        return $default;
+    }
+
+    private function normalizeWhitespace(string $content)
+    {
+        return preg_replace('/[[:space:]]+/', ' ', trim(strip_tags($content)));
+    }
+
+    /**
+     * Determine if the comparison text is a prefix of the full text
+     */
+    private function isPrefixOf(string $compare, string $full_text): bool
+    {
+        return (strpos($full_text, $compare) === 0);
+    }
+
+    private function wrapElement(
+        string $content,
+        string $opening = '<div>',
+        string $closing = '</div>'
+    ) {
+        return $opening . $content . $closing;
+    }
+
+    private function wrapMicroformatElement(Page $page): void
+    {
+        $div = sprintf('<div class="%s">', $this->request->type);
+        $page->body = $this->wrapElement($page->body, $div);
+    }
+
+    private function httpResponse($response, int $http_status = 400, array $headers = []): void
+    {
+        foreach ($headers as $key => $value) {
+            $header = sprintf('%s: %s', $key, $value);
+            header($header);
+        }
+
         http_response_code($http_status);
 
-        /*if ($http_status === 401) {
-            header(sprintf('WWW-Authenticate: Bearer realm="%s"', $this->urls->httpRoot));
-        }*/
-
         if (is_array($response)) {
+            header('Content-Type: application/json; charset=UTF-8');
             echo json_encode($response);
         } else {
             echo $response;
